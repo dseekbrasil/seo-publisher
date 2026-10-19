@@ -1,1 +1,34 @@
-.github/ISSUE_TEMPLATE/publish-article.yml
+name: Publish Article
+description: Submit an article to publish. Fill all fields, then add the approved label.
+body:
+  - type: input
+    id: article_title
+    attributes:
+      label: Article title
+      description: The headline of the article.
+    validations:
+      required: true
+
+  - type: textarea
+    id: article_content
+    attributes:
+      label: Article content
+      description: The full article. You can use Markdown (## heading, - list, **bold**).
+    validations:
+      required: true
+
+  - type: input
+    id: anchor_text
+    attributes:
+      label: Anchor text
+      description: The exact words that should become the link.
+    validations:
+      required: true
+
+  - type: input
+    id: target_url
+    attributes:
+      label: Target website URL
+      description: Must start with http:// or https://
+    validations:
+      required: true
