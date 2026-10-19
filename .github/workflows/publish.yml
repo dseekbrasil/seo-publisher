@@ -1,0 +1,134 @@
+name: Publish approved article
+
+# Runs only when a label is added to an issue. The job body then checks that
+# the label is exactly "approved", so nothing publishes without approval.
+on:
+  issues:
+    types: [labeled]
+
+# Only the minimum permissions needed: write repo contents (commit the page)
+# and write issues (comment the result back). No pages/deploy permission is
+# needed because Pages here deploys automatically from the branch.
+permissions:
+  contents: write
+  issues: write
+
+# Never let two publish runs push at the same time -> avoids git conflicts.
+concurrency:
+  group: publish-articles
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Gate: only proceed for the "approved" label.
+    if: github.event.label.name == 'approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Generate the article page
+        id: gen
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          REPO: ${{ github.repository }}
+          REPO_ROOT: .
+        run: |
+          python3 scripts/publish_article.py
+
+      - name: Commit and push the new page
+        id: commit
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          SLUG: ${{ steps.gen.outputs.slug }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add articles/
+          if git diff --cached --quiet; then
+            echo "Nothing changed (already published?)."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "Publish article from issue #${ISSUE_NUMBER} (${SLUG})"
+          # Rebase on top of any concurrent change, then push with one retry.
+          for i in 1 2 3; do
+            git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}" && break
+            echo "push attempt $i failed; retrying..."
+            sleep 5
+          done
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the page to go live
+        id: verify
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          LIVE_URL: ${{ steps.gen.outputs.live_url }}
+        run: |
+          echo "Checking ${LIVE_URL} ..."
+          ok=false
+          # Poll up to ~5 minutes for GitHub Pages to rebuild.
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${LIVE_URL}" || echo 000)
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then ok=true; break; fi
+            sleep 10
+          done
+          if [ "$ok" = "true" ]; then
+            echo "live=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "live=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment success and mark published
+        if: steps.verify.outputs.live == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const url = "${{ steps.gen.outputs.live_url }}";
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `✅ Published and live: ${url}`
+            });
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ["published"]
+            });
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: "closed"
+            });
+
+      - name: Comment if committed but not yet verified live
+        if: steps.commit.outputs.changed == 'true' && steps.verify.outputs.live != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const url = "${{ steps.gen.outputs.live_url }}";
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `⚠️ The page was committed but did not return HTTP 200 within ~5 minutes. It often goes live a little later. Check: ${url}\nIf it stays down, re-run this workflow from the Actions tab.`
+            });
+
+      - name: Report generation/validation failure
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `❌ Publishing failed. Open the failed run under the **Actions** tab to see the reason (usually a missing field or an invalid target URL). Fix the issue body, remove and re-add the **approved** label to retry.`
+            });
